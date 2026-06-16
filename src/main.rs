@@ -32,6 +32,7 @@ async fn handle_client(socket: &mut TcpStream, client_addr: SocketAddr, data_set
                     match commands[0].as_str(){
                         "GET" => handle_get(socket, &commands[1], &data_set).await,
                         "SET" => handle_set(socket, &commands[1], &commands[2], &data_set).await,
+                        "DEL" => handle_del(socket, &commands[1], &data_set).await,
                         _ => match socket.write(b"-ERR Unknown Command\r\n").await{
                             Ok(_) => (),
                             Err(_e) => println!("Socket write failed"),
@@ -69,6 +70,22 @@ async fn handle_set(socket: &mut TcpStream, key: &String, val: &String, data_set
     match socket.write(b"+OK\r\n").await{
         Ok(_) => (),
         Err(_e) => println!("Socket write failed!"),
+    }
+}
+
+async fn handle_del(socket: &mut TcpStream, key: &String, data_set: &Arc<RwLock<HashMap<String, String>>>){
+    let mut map = data_set.write().await;
+    match map.remove(key){
+        Some(_res) => {
+            match socket.write(b"+OK\r\n").await{
+                Ok(_) => (),
+                Err(_e) => println!("Socket write failed!"),
+            } 
+        },
+        _ => match socket.write(b"$-1\r\n").await{
+            Ok(_) => (),
+            Err(_e) => println!("Socket write failed!"),
+        }
     }
 }
 
