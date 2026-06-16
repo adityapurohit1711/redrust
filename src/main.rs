@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::time::{Duration, Instant};
 use std::ops::Add;
+use std::io::Write;
 
 struct Entry{
     value: String,
@@ -25,6 +26,7 @@ impl Entry{
 
 async fn handle_client(socket: &mut TcpStream, client_addr: SocketAddr, data_set: Arc<RwLock<HashMap<String, Entry>>>){
     let mut buffer = [0; 512];
+    let mut out = Vec::with_capacity(512);
     loop {
         match socket.read(&mut buffer).await{
             Ok(0) => break,
@@ -37,14 +39,15 @@ async fn handle_client(socket: &mut TcpStream, client_addr: SocketAddr, data_set
                     },
                 };
                 
-                println!("Received command {:?} from client {:?}", commands, client_addr);
+                // println!("Received command {:?} from client {:?}", commands, client_addr);
                 
                 if commands.len() > 0{
                     match commands[0].as_str(){
-                        "GET" => handle_get(socket, &commands[1], &data_set).await,
+                        "GET" => handle_get(socket, &commands[1], &data_set, &mut out).await,
                         "SET" => handle_set(socket, &commands[1], &commands[2], &data_set).await,
                         "DEL" => handle_del(socket, &commands[1], &data_set).await,
                         "EXPIRE" => handle_exp(socket, &commands[1], &commands[2], &data_set).await,
+                        "PING" => handle_ping(socket).await,
                         _ => match socket.write(b"-ERR Unknown Command\r\n").await{
                             Ok(_) => (),
                             Err(_e) => println!("Socket write failed"),
@@ -58,7 +61,7 @@ async fn handle_client(socket: &mut TcpStream, client_addr: SocketAddr, data_set
     
 }
 
-async fn handle_get(socket: &mut TcpStream, key: &String, data_set: &Arc<RwLock<HashMap<String, Entry>>>){
+async fn handle_get(socket: &mut TcpStream, key: &String, data_set: &Arc<RwLock<HashMap<String, Entry>>>, out: &mut Vec<u8>){
     let map = data_set.read().await;
     match map.get(key){
         Some(res) => {
@@ -73,12 +76,15 @@ async fn handle_get(socket: &mut TcpStream, key: &String, data_set: &Arc<RwLock<
                         Err(_e) => println!("Socket write failed!"),
                     }
                 }else{
-                    let len = (*val).len();
-                    let res_string = format!("${}\r\n{}\r\n", len, *val);
-                    match socket.write(res_string.as_bytes()).await{
-                    Ok(_) => (),
-                    Err(_e) => println!("Socket write failed!")
-                }
+                    out.clear();
+                    write!(out, "${}\r\n", val.len()).unwrap();
+                    out.extend_from_slice(val.as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                    
+                    match socket.write(&out).await{
+                        Ok(_) => (),
+                        Err(_e) => println!("Socket write failed!")
+                    }
             }
         },
         _ => match socket.write(b"$-1\r\n").await{
@@ -147,6 +153,13 @@ async fn handle_exp(socket: &mut TcpStream, key: &String, expiry: &String, data_
                 Err(_e) => println!("Socket write failed!"),
             }
         }
+    }
+}
+
+async fn handle_ping(socket: &mut TcpStream){
+    match socket.write(b"+PONG\r\n").await{
+        Ok(_) => (),
+        Err(_e) => println!("Socket write failed!!")
     }
 }
 
