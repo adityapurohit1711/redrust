@@ -6,18 +6,29 @@ use std::net::SocketAddr;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+use std::ops::Add;
 
-async fn handle_client(socket: &mut TcpStream, client_addr: SocketAddr, data_set: Arc<RwLock<HashMap<String, String>>>){
+struct Entry{
+    value: String,
+    expires_at: Option<Instant>
+}
+
+impl Entry{
+    fn new(value: String, expires_at: Option<Instant>) -> Self{
+        Self{
+            value,
+            expires_at
+        }
+    }
+}
+
+async fn handle_client(socket: &mut TcpStream, client_addr: SocketAddr, data_set: Arc<RwLock<HashMap<String, Entry>>>){
     let mut buffer = [0; 512];
     loop {
         match socket.read(&mut buffer).await{
             Ok(0) => break,
             Ok(n) => {
-                // match socket.write(&buffer[0..n]).await{
-                //     Ok(_)=> (),
-                //     Err(_e) => println!("Socket write failed"),
-                // };
-                
                 let commands = match parse_resp(&buffer[0..n]){
                     Ok(res) => res,
                     Err(e) => {
@@ -33,6 +44,7 @@ async fn handle_client(socket: &mut TcpStream, client_addr: SocketAddr, data_set
                         "GET" => handle_get(socket, &commands[1], &data_set).await,
                         "SET" => handle_set(socket, &commands[1], &commands[2], &data_set).await,
                         "DEL" => handle_del(socket, &commands[1], &data_set).await,
+                        "EXPIRE" => handle_exp(socket, &commands[1], &commands[2], &data_set).await,
                         _ => match socket.write(b"-ERR Unknown Command\r\n").await{
                             Ok(_) => (),
                             Err(_e) => println!("Socket write failed"),
@@ -46,15 +58,27 @@ async fn handle_client(socket: &mut TcpStream, client_addr: SocketAddr, data_set
     
 }
 
-async fn handle_get(socket: &mut TcpStream, key: &String, data_set: &Arc<RwLock<HashMap<String, String>>>){
+async fn handle_get(socket: &mut TcpStream, key: &String, data_set: &Arc<RwLock<HashMap<String, Entry>>>){
     let map = data_set.read().await;
     match map.get(key){
         Some(res) => {
-                let len = (*res).len();
-                let res_string = format!("${}\r\n{}\r\n", len, *res);
-                match socket.write(res_string.as_bytes()).await{
-                Ok(_) => (),
-                Err(_e) => println!("Socket write failed!")
+                let val = &res.value;
+                
+                if check_expired(res){
+                    drop(map);
+                    let mut map = data_set.write().await;
+                    map.remove(key);
+                    match socket.write(b"$-1\r\n").await{
+                        Ok(_) => (),
+                        Err(_e) => println!("Socket write failed!"),
+                    }
+                }else{
+                    let len = (*val).len();
+                    let res_string = format!("${}\r\n{}\r\n", len, *val);
+                    match socket.write(res_string.as_bytes()).await{
+                    Ok(_) => (),
+                    Err(_e) => println!("Socket write failed!")
+                }
             }
         },
         _ => match socket.write(b"$-1\r\n").await{
@@ -64,16 +88,20 @@ async fn handle_get(socket: &mut TcpStream, key: &String, data_set: &Arc<RwLock<
     }
 }
 
-async fn handle_set(socket: &mut TcpStream, key: &String, val: &String, data_set: &Arc<RwLock<HashMap<String, String>>>){
+async fn handle_set(socket: &mut TcpStream, key: &String, val: &String, data_set: &Arc<RwLock<HashMap<String, Entry>>>){
+    let new_entry = Entry::new(val.to_string(), None);
+    
     let mut map = data_set.write().await;
-    map.insert((*key).to_string(), (*val).to_string());
+    
+    map.insert(key.to_string(), new_entry);
+    
     match socket.write(b"+OK\r\n").await{
         Ok(_) => (),
         Err(_e) => println!("Socket write failed!"),
     }
 }
 
-async fn handle_del(socket: &mut TcpStream, key: &String, data_set: &Arc<RwLock<HashMap<String, String>>>){
+async fn handle_del(socket: &mut TcpStream, key: &String, data_set: &Arc<RwLock<HashMap<String, Entry>>>){
     let mut map = data_set.write().await;
     match map.remove(key){
         Some(_res) => {
@@ -86,6 +114,48 @@ async fn handle_del(socket: &mut TcpStream, key: &String, data_set: &Arc<RwLock<
             Ok(_) => (),
             Err(_e) => println!("Socket write failed!"),
         }
+    }
+}
+
+async fn handle_exp(socket: &mut TcpStream, key: &String, expiry: &String, data_set: &Arc<RwLock<HashMap<String, Entry>>>){
+    let expiry_secs: u64 = match expiry.parse(){
+        Ok(sec) => sec,
+        Err(_) => {
+            match socket.write(b"-ERR value is not an integer\r\n").await{
+                Ok(_) => (),
+                Err(_e) => println!("Socket write failed"),
+            }
+            return;
+        },
+    };
+    let now = Instant::now();
+    let expires_at = Some(now.add(Duration::new(expiry_secs, 0)));
+    
+    let mut map = data_set.write().await;
+    
+    match map.get_mut(key){
+        Some(entry) => {
+            entry.expires_at = expires_at;
+            match socket.write(b":1\r\n").await{
+              Ok(_) => (),
+              Err(_e) => println!("Socket write failed!"),  
+            };
+        },
+        None => {
+            match socket.write(b":0\r\n").await{
+                Ok(_) => (),
+                Err(_e) => println!("Socket write failed!"),
+            }
+        }
+    }
+}
+
+
+fn check_expired(data: &Entry) -> bool{
+    let now = Instant::now();
+    match data.expires_at{
+        Some(exp) => now > exp,
+        None => false, 
     }
 }
 
